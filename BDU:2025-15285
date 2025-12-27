@@ -1,3 +1,228 @@
 ## Уязвимость компонента GetPasswordExpirationDate интерфейса прикладного программирования Exchange Web Services, позволяющая нарушителю получить несанкционированный доступ к защищаемой информации
+ВОПРОС: В чём конкретно уязвимость?
+ОТВЕТ: Authorization Bypass - GetPasswordExpirationDate раскрывает AD атрибуты без проверки прав доступа к Active Directory
+Описание проблемы:
+------------------
+Exchange GetPasswordExpirationDate выполняет LDAP запрос к Active Directory для получения msDS-UserPasswordExpiryTimeComputed используя ПРИВИЛЕГИРОВАННЫЙ контекст (Exchange Service Account) вместо контекста конечного пользователя.
 
+Это позволяет пользователям обойти AD ACLs и получить информацию, к которой они НЕ должны иметь доступа согласно Active Directory permissions.
+
+## ЧТО ВОЗВРАЩАЕТ GetPasswordExpirationDate?
+
+1.1 Exchange EWS Operation
+---------------------------
+
+Официальная документация Microsoft:
+https://learn.microsoft.com/en-us/exchange/client-developer/web-service-reference/getpasswordexpirationdate-operation
+
+Цитата из документации:
+"The GetPasswordExpirationDate operation provides the email account password expiration date for the current user."
+
+Возвращаемое значение:
+<PasswordExpirationDate>2026-05-16T13:59:21.3075592Z</PasswordExpirationDate>
+
+Формат: ISO 8601 DateTime
+
+1.2 Откуда берётся это значение?
+---------------------------------
+
+Exchange НЕ хранит password expiration dates в своей базе данных.
+Exchange ЗАПРАШИВАЕТ это значение из Active Directory.
+
+## КАКИЕ AD АТРИБУТЫ ИСПОЛЬЗУЮТСЯ?
+2.1 Основной атрибут: msDS-UserPasswordExpiryTimeComputed
+----------------------------------------------------------
+
+LDAP Attribute Name: msDS-UserPasswordExpiryTimeComputed
+Attribute ID: 1.2.840.113556.1.4.2061
+Syntax: Large Integer / Integer8 (64-bit)
+Category: Constructed (computed attribute)
+
+Официальная документация Microsoft:
+https://docs.microsoft.com/en-us/windows/win32/adschema/a-msds-userpasswordexpirytimecomputed
+
+Описание (из MS Docs):
+"This constructed attribute is the computed password expiration date and time for the user. This value is based on the password last set time, the password maximum age policy for the domain, and the user account control flags."
+
+Ключевое слово: CONSTRUCTED ATTRIBUTE
+- Это не обычный атрибут, хранящийся в базе AD
+- Это COMPUTED (вычисляемый) атрибут
+- Active Directory вычисляет его "на лету" при запросе
+
+2.2 Формула вычисления msDS-UserPasswordExpiryTimeComputed
+-----------------------------------------------------------
+
+Microsoft вычисляет этот атрибут по следующей формуле:
+
+IF (userAccountControl & ADS_UF_DONT_EXPIRE_PASSWD):
+    msDS-UserPasswordExpiryTimeComputed = 9223372036854775807  (max int64)
+    В человекочитаемом виде: 9999-12-31T23:59:59.9999999Z
+
+ELSE IF (pwdLastSet == 0):
+    msDS-UserPasswordExpiryTimeComputed = 0  (пароль должен быть изменён при следующем входе)
+
+ELSE:
+    msDS-UserPasswordExpiryTimeComputed = pwdLastSet + maxPwdAge
+
+Где:
+- userAccountControl: флаги аккаунта (атрибут пользователя)
+- pwdLastSet: дата последней смены пароля (атрибут пользователя)
+- maxPwdAge: максимальный возраст пароля (DOMAIN POLICY)
+
+2.3 Используемые атрибуты пользователя
+---------------------------------------
+
+Атрибут 1: pwdLastSet
+---------------------
+LDAP Attribute Name: pwdLastSet
+Attribute ID: 1.2.840.113556.1.4.96
+Syntax: Large Integer / Integer8
+Format: Windows FILETIME (100-nanosecond intervals since 1601-01-01)
+
+MS Docs: https://docs.microsoft.com/en-us/windows/win32/adschema/a-pwdlastset
+
+Описание:
+"The date and time that the password for this account was last changed."
+
+Специальные значения:
+- 0 = User must change password at next logon
+- -1 = Устанавливается при сбросе пароля администратором
+
+Доступ:
+- По умолчанию: Authenticated Users READ (но может быть ограничен!)
+
+Атрибут 2: userAccountControl
+-----------------------------
+LDAP Attribute Name: userAccountControl
+Attribute ID: 1.2.840.113556.1.4.8
+Syntax: Integer
+Format: Битовая маска (flags)
+
+MS Docs: https://docs.microsoft.com/en-us/troubleshoot/windows-server/identity/useraccountcontrol-manipulate-account-properties
+
+Интересующий флаг:
+ADS_UF_DONT_EXPIRE_PASSWD = 0x10000 (65536)
+- Если установлен: пароль НИКОГДА не истекает
+- Типично для service accounts
+
+Другие релевантные флаги:
+- ADS_UF_ACCOUNTDISABLE = 0x02 (аккаунт отключён)
+- ADS_UF_LOCKOUT = 0x10 (аккаунт заблокирован)
+
+Доступ:
+- По умолчанию: Authenticated Users READ
+
+2.4 Используемая Domain Policy
+-------------------------------
+
+Атрибут: maxPwdAge
+------------------
+Расположение: Domain Object (например, DC=test,DC=htpro,DC=com)
+LDAP Attribute Name: maxPwdAge
+Attribute ID: 1.2.840.113556.1.4.92
+Syntax: Large Integer / Integer8
+Format: Отрицательное значение в 100-nanosecond intervals
+
+MS Docs: https://docs.microsoft.com/en-us/windows/win32/adschema/a-maxpwdage
+
+Описание:
+"The maximum password age in the domain. This value is stored as a large integer representing the number of 100-nanosecond intervals (negative value)."
+
+Пример:
+-36288000000000 = 42 дня
+
+Доступ:
+- По умолчанию: Authenticated Users READ (domain policy общедоступна)
+
+## КАК EXCHANGE ПОЛУЧАЕТ msDS-UserPasswordExpiryTimeComputed?
+
+3.1 Exchange Backend Process
+-----------------------------
+
+Когда вызывается GetPasswordExpirationDate:
+
+1. EWS Frontend получает SOAP запрос
+2. EWS передаёт запрос в Exchange Backend
+3. Exchange Backend определяет Distinguished Name пользователя по email
+4. Exchange выполняет LDAP запрос к Domain Controller:
+   
+   LDAP Query:
+   -----------
+   Base DN: CN=User,OU=...,DC=domain,DC=com
+   Filter: (objectClass=*)
+   Attributes: msDS-UserPasswordExpiryTimeComputed
+   Scope: BASE
+
+5. Domain Controller ВЫЧИСЛЯЕТ msDS-UserPasswordExpiryTimeComputed
+6. Domain Controller возвращает значение Exchange
+7. Exchange конвертирует из FILETIME в ISO 8601
+8. Exchange возвращает результат клиенту
+
+3.2 Контекст безопасности LDAP запроса
+---------------------------------------
+
+# КРИТИЧЕСКИЙ ВОПРОС: От чьего имени Exchange выполняет LDAP запрос?
+
+Вариант A: От имени конечного пользователя (правильно)
+- Exchange использует credentials пользователя для LDAP bind
+- AD проверяет права пользователя на чтение атрибута
+- Если нет прав → Access Denied
+
+Вариант B: От имени Exchange Service Account (НЕПРАВИЛЬНО!)
+- Exchange использует свой service account для LDAP bind
+- Exchange service account имеет расширенные права в AD
+- AD проверяет права service account (НЕ конечного пользователя!)
+- Пользователь получает данные, к которым НЕ должен иметь доступа
+
+ГИПОТЕЗА: Exchange использует Вариант B
+
+## Вывод:
+------
+Mailbox access НЕ должен давать доступ к msDS-UserPasswordExpiryTimeComputed, потому что это AD domain policy, а не mailbox data.
+
+## Пошаговое объяснение уязвимости
+
+Шаг 1: Администратор AD настраивает security
+
+Администратор ОГРАНИЧИВАЕТ доступ к password-related атрибутам:
+- Убирает READ права на pwdLastSet для Authenticated Users
+- Убирает READ права на msDS-UserPasswordExpiryTimeComputed
+- Цель: предотвратить enumeration сервисных аккаунтов
+
+Конфигурация AD ACL для msDS-UserPasswordExpiryTimeComputed:
+- SELF: READ PROPERTY
+- Authenticated Users: (нет прав)
+- Domain Admins: FULL CONTROL
+
+Шаг 2: Пользователь пытается выполнить прямой LDAP запрос
+
+Пользователь test выполняет:
+
+ldapsearch ... -b "CN=adm101,..." msDS-UserPasswordExpiryTimeComputed
+
+Результат: Access Denied (правильно!)
+Причина: У Authenticated Users нет READ прав на этот атрибут
+
+Шаг 3: Пользователь использует Exchange EWS
+
+Пользователь test вызывает:
+
+GetPasswordExpirationDate(MailboxSmtpAddress="adm101@test.htpro.com")
+
+Exchange выполняет LDAP запрос:
+- От имени: Exchange Service Account (например, DOMAIN\ExchangeService)
+- Exchange Service Account имеет права: Domain Admins или подобные
+- AD возвращает msDS-UserPasswordExpiryTimeComputed
+
+Результат: NoError, PasswordExpirationDate=9999-12-30T23:59:59Z
+
+Пользователь ПОЛУЧИЛ данные, несмотря на то что у него НЕТ прав в AD!
+
+# Уязвимость эксплуатирована
+
+Пользователь обошёл AD security:
+- Узнал что adm101 имеет password never expires
+- Идентифицировал сервисный аккаунт
+- Получил информацию о domain policy
+- Всё это БЕЗ прав доступа к AD атрибутам
 
