@@ -9,6 +9,10 @@ Public reports of identified vulnerabilities prepared for CVE and BDU registrati
 - CVE-2025-46183
 - BDU-2025-04736
 - BDU-2025-04735
+- BDU:2025-11130
+- BDU:2025-11472
+- BDU:2025-11473
+- BDU:2025-15285
 
 - 
 
